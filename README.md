@@ -1,149 +1,130 @@
 # sandbox-here
 
-Run a command isolated to the current directory — no access to the rest of
-your home, no network, no other writable paths except the app's own config
-files.
+Run a command so it can only see the current directory and its own config
+files.  Everything else in your home directory is either read-only or
+hidden completely.
 
-## What it does
+It's a Python script that builds a bubblewrap container and drops your
+command inside.  No SUID binaries, no daemon, no root.  Just Linux
+namespaces.
 
-`sandbox-here` wraps [bubblewrap](https://github.com/containers/bubblewrap) to
-create a Linux-namespace container where:
+## Why?
 
-| Path | Access | Notes |
-|------|--------|-------|
-| `$PWD` (as `/work`) | **read-write** | The only data you can modify |
-| App's own configs | **read-write** | Auto-discovered (see below) |
-| Other dotfiles in `$HOME` | read-only | Other apps' settings, visible but safe |
-| Non-dot directories in `$HOME` | **hidden** | `~/src`, `~/Downloads`, `~/Documents`, etc. don't exist |
-| `/usr`, `/bin`, `/etc`, … | read-only | Needed to run binaries |
-| `/tmp`, `/run` | private tmpfs | Empty, scrubbed on exit |
-| Network | **none** | `--unshare-all` includes net namespace |
-| `/root`, `/mnt`, `/media`, `/var`, `/opt` | **hidden** | Not mounted |
+AI coding agents run LLM-generated shell commands on your machine.  Even
+with human approval on each one, there's a lot that can go wrong — reading
+SSH keys, scraping shell history, exfiltrating `~/Documents`, modifying
+git config, leaking internal hostnames.
+
+`sandbox-here` closes that gap.  The command sees the project directory
+and its own config.  That's it.
+
+## What it's not
+
+It's not a jail for untrusted code.  A determined attacker will get out.
+User namespaces are a hardening tool, not a security boundary.  With
+`--net`, the command can make arbitrary outbound connections.  There's no
+seccomp filter unless you add one, no resource limits, and writes to the
+app's own config directory persist on disk.
+
+Think of it like locking your car.  Stops casual snooping and mistakes.
+Won't stop someone with a brick.  For running code you genuinely don't
+trust, use a VM or a separate machine.
+
+## Installation
+
+```bash
+mkdir -p ~/.config/sandbox-here
+cp sandbox-here ~/.config/sandbox-here/
+chmod +x ~/.config/sandbox-here/sandbox-here
+```
+
+Needs bubblewrap 0.11+ and Python 3.10+.  That's it.
+
+Then alias it in your shell:
+
+```bash
+alias sbh="$HOME/.config/sandbox-here/sandbox-here"
+```
+
+(`sbh` is what I use day-to-day.  The full name works too.)
 
 ## Usage
 
 ```bash
-# Open a shell isolated to the current directory
-sandbox-here
+# Open a shell sandboxed to the current directory
+sbh
 
-# Run any command sandboxed
-sandbox-here vim file.txt
-sandbox-here make
-sandbox-here npm install
-sandbox-here python -m http.server
+# Run a command
+sbh npm install
+sbh make
+sbh cargo build
+
+# Allow network — for package managers, curl, etc.
+sbh --net pip install requests
 ```
 
-## Dependencies
+When you run `sbh npm`, the script figures out the app is `npm` and mounts
+`~/.npm/` read-write so it can use the cache.  `sbh cargo` gets `~/.cargo/`,
+`sbh git` gets `~/.gitconfig`, and so on.  If you run `sbh` with no command
+it opens your shell and makes the shell's own configs writable.
 
-- **bubblewrap** (`bwrap`) — available in all major distros (`apt install bubblewrap`, `dnf install bubblewrap`, `pacman -S bubblewrap`)
-- **Python 3.6+** — standard library only (`os`, `shutil`, `sys`, `pathlib`)
+Symlinks are followed.  If `/usr/bin/sh` points to `bash`, running `sbh sh`
+grants write access to `~/.bashrc` and `~/.config/bash/`.
 
-## How config discovery works
+## What gets blocked
 
-When you run `sandbox-here <command>`, the script:
-
-1. **Extracts the app name** from the command (basename of the first argument).
-
-2. **Resolves symlinks** through `$PATH` — if `sh` is a symlink to `bash`,
-   both `"sh"` and `"bash"` are used as app names.
-
-3. **Checks well-known config paths** for each name:
-
-   | Pattern | Example for `nvim` |
-   |---------|-------------------|
-   | `~/.config/<app>/` | `~/.config/nvim/` |
-   | `~/.cache/<app>/` | `~/.cache/nvim/` |
-   | `~/.local/share/<app>/` | `~/.local/share/nvim/` |
-   | `~/.local/state/<app>/` | `~/.local/state/nvim/` |
-   | `~/.<app>/` | `~/.nvim/` |
-   | `~/.<app>rc` | `~/.nvimrc` |
-
-   Only paths that actually exist on the host are mounted.
-
-4. **Everything else** under `$HOME/.*` is mounted read-only; non-dot
-   directories are never mounted and therefore invisible inside the sandbox.
-
-### Why symlink resolution matters
-
-```bash
-$ ls -l /usr/bin/sh
-lrwxrwxrwx 1 root root 4 … /usr/bin/sh -> bash
-```
-
-`sandbox-here sh` will grant write access to `~/.bashrc` and
-`~/.config/bash/` because the real binary behind `sh` is `bash`.
-
-## Mount layering — why read-only comes before writable
-
-bwrap mounts are processed in order; later mounts override earlier ones at
-the same path or subtree.  The script mounts things in this order:
+Sensitive paths are invisible — not even mounted read-only:
 
 ```
-1. --tmpfs $HOME           ← empty home
-2. --ro-bind-try  each other dotfile/dotdir
-3. --bind-try      each app-owned config path   ← punches through step 2
+.ssh .gnupg .codex .pki .docker .mozilla .thunderbird .librewolf
+.aws .azure .gcloud .gsutil .copilot .electrum .tor .gnome .kde4
 ```
 
-Without this ordering, a read-only `~/.config` parent mount would shadow
-the writable `~/.config/nvim/` child mount, making it impossible for the
-app to write its own configs.  By mounting read-only parents first and
-writable children second, the writable bind "punches through" and wins.
+Environment variables are wiped clean.  Only a short safelist gets
+re-injected (`PATH`, `HOME`, `TERM`, `LANG`, a few toolchain vars).
+`DEEPSEEK_API_KEY`, `SSH_AUTH_SOCK`, `SSLKEYLOGFILE`, `DISPLAY`,
+`DBUS_SESSION_BUS_ADDRESS` — all stripped.  If you need to pass something
+through, prefix it with `SANDBOX_`.
 
-## Filesystem layout inside the sandbox
+`/etc/hosts` is overlaid with a minimal file so your internal hostnames
+(LAN machines, Tailnet nodes, etc.) don't leak.
 
-```
-/                        ← only system dirs + tmpfs mounts
-├── usr/                 (ro)
-├── bin/                 (ro)
-├── etc/                 (ro)
-├── dev/                 (private)
-├── proc/                (private)
-├── tmp/                 (private, empty)
-├── run/                 (private, empty)
-├── home/<user>/         (tmpfs + selective bind mounts)
-│   ├── .config/nvim/    (rw)  ← app's own config
-│   ├── .config/git/     (ro)  ← other app, visible but safe
-│   ├── .bashrc          (ro or rw, depending on which app is running)
-│   ├── .ssh/            (ro)
-│   └── Downloads/       DOES NOT EXIST
-└── work/                (rw)  ← your $PWD
-```
+Network is off by default.  `--net` turns it on.
 
-## Design decisions
+## What doesn't get blocked
 
-**Why Python instead of shell?**  The config-discovery logic (symlink
-resolution, path classification, mount ordering) outgrew zsh.  Python's
-`pathlib` and `shutil.which` make the code readable and correct.
+Any dotfile not on the blocklist is visible read-only — `.bashrc`,
+`.gitconfig`, `.vimrc`, and so on.  If you stash secrets in those,
+they're visible.
 
-**Why bubblewrap instead of firejail/systemd-nspawn?**  bubblewrap is
-unprivileged (uses user namespaces), has no SUID binary, gives precise
-control over every mount point, and is available everywhere.
+With `--net`, the command has the same network access you do.  It can hit
+localhost services, scan your LAN, make outbound connections.
 
-**Why auto-discover dotfiles instead of a hardcoded list?**  A hardcoded
-allowlist would rot as you install new tools.  Globbing `$HOME/.*` at
-runtime automatically picks up every config file, present and future.
+The app's own config directory is writable and persists to disk.  If you
+run `sbh pi`, the agent's config at `~/.pi/` survives sandbox teardown.
+That's by design (the agent needs it), but it means a compromised agent
+can modify its own settings to persist across restarts.
 
-**Why separate `/work` instead of mounting `$PWD` in-place?**  If `$PWD` is
-under `$HOME` and we mount `$HOME` as tmpfs, we'd need to punch a writable
-hole at the exact right path.  Using a separate `/work` mount point avoids
-this conflict entirely.
+`/etc/passwd`, `/proc/cpuinfo`, and other world-readable system files are
+visible.  No attempt is made to hide them.
 
-**Why `--die-with-parent`?**  If the outer shell is killed, the sandbox
-must be torn down too.  Without this flag, bwrap namespaces can outlive
-the parent process and leak resources.
+## Seccomp
+
+Optional.  Drop a `seccomp.bpf` next to the script and it gets loaded.
+bubblewrap's repo has example policies.  Without one, no syscall filtering
+happens.
 
 ## Files
 
 ```
 ~/.config/sandbox-here/
-├── sandbox-here    ← the Python script (executable)
-└── README.md       ← this file
+├── sandbox-here      the script
+├── seccomp.bpf       optional syscall filter
+├── README.md         this file
+└── AGENTS.md         reference for AI agents running inside the sandbox
 ```
 
-A small zsh wrapper function in `~/.zshrc` calls the script:
+## License
 
-```zsh
-sandbox-here() {
-    "$HOME/.config/sandbox-here/sandbox-here" "$@"
-}
-```
+Do whatever you want.  It's a few hundred lines of Python that wraps
+bubblewrap.  Don't care.

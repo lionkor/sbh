@@ -6,49 +6,143 @@ Uses bubblewrap to create a container where only $PWD is writable.
 The command's own config files (~/.config/<app>, ~/.cache/<app>,
 ~/.<app>/, ~/.<app>rc, etc.) are auto-discovered and mounted
 read-write so the app can read and update its settings.  All other
-dotfiles in $HOME are mounted read-only; non-dot directories
-(Downloads, Documents, src, …) don't exist in the sandbox.
+dotfiles in $HOME are mounted read-only — except for a blocklist of
+sensitive paths (SSH keys, GPG keyring, API tokens, browser profiles,
+etc.) which are hidden entirely.
 
 No access to /root, /mnt, /media, /var, /opt.
-Network is isolated by default.  Set SANDBOX_NET=1 to allow it
-(e.g. for API calls, package managers, etc.).
+Network is isolated by default.  Set SANDBOX_NET=1 or pass --net to
+allow it (e.g. for API calls, package managers, etc.).
 
-Dependencies: bubblewrap (bwrap)
+All parent environment variables are stripped; only a curated safelist
+(PATH, TERM, HOME, …) is forwarded.  Sensitive variables like API keys
+and display cookies are never leaked into the sandbox.
+
+Dependencies: bubblewrap ≥ 0.11 (for --bind-data, --clearenv)
 
 Usage: sandbox-here [--net] [command...]
        sandbox-here              (opens $SHELL in the sandbox)
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 import sys
-import tempfile
 from pathlib import Path
+from typing import Never
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Constants
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Dotfiles / dotdirs that must *never* be exposed — not even read-only.
+# Each entry is the basename of a path directly under $HOME.
+_SENSITIVE_DOTFILES: set[str] = {
+    ".ssh",          # private keys, known_hosts, agent socket
+    ".gnupg",        # GPG keyring
+    ".codex",        # OpenAI JWT access / refresh tokens
+    ".pki",          # NSS certificate database
+    ".docker",       # Docker registry credentials
+    ".mozilla",      # Firefox profiles (cookies, saved logins)
+    ".thunderbird",  # Thunderbird profiles
+    ".librewolf",    # LibreWolf profiles
+    ".aws",          # AWS CLI credentials
+    ".azure",        # Azure CLI credentials
+    ".gcloud",       # GCP credentials
+    ".gsutil",       # GCP storage credentials
+    ".copilot",      # GitHub Copilot auth
+    ".electrum",     # Bitcoin wallet
+    ".tor",          # Tor hidden-service keys
+    ".gnome",        # GNOME keyring / online-accounts
+    ".kde4",         # KDE wallet
+    ".mcli",         # minecraft launcher credentials
+}
+
+# Environment variables that are allowed into the sandbox.
+# Everything else is stripped (--clearenv), then these are re-injected.
+# Variables whose name starts with "SANDBOX_" always pass through.
+_SAFE_ENV_VARS: set[str] = {
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "BROWSER",
+    "COLORTERM",
+    "NO_COLOR",
+    "CLICOLOR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    # language toolchains — needed to find compilers & runtimes
+    "JAVA_HOME",
+    "GOPATH",
+    "GOROOT",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "NVM_DIR",
+    "PYTHONPATH",
+    "PERL5LIB",
+    "ANDROID_HOME",
+    "ANDROID_SDK_ROOT",
+    "GRADLE_HOME",
+    "CUDA_PATH",
+    "VCPKG_ROOT",
+    "MAKEFLAGS",
+}
+
+# Minimal /etc/hosts — prevents leaking internal hostnames (raptor,
+# dragon, etc.) from the host's real file.
+_MINIMAL_HOSTS: bytes = (
+    b"127.0.0.1   localhost\n"
+    b"::1         localhost ip6-localhost ip6-loopback\n"
+)
+
+# Path to an optional seccomp BPF policy file (lives next to this script).
+# If present, loaded with ``--seccomp`` to restrict available syscalls.
+# An example policy can be found in the bubblewrap repository:
+# https://github.com/containers/bubblewrap/tree/main/demos
+_SECCOMP_PROFILE: Path = Path(__file__).resolve().parent / "seccomp.bpf"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _resolve_app_names(cmd_arg: str) -> list[str]:
     """
     Return every name the app could be known as.
 
-    Resolves the command through PATH and follows symlinks so that, e.g.,
-    ``vim`` (symlinked to ``nvim``) yields ``["vim", "nvim"]``, and
+    Resolves the command through ``$PATH`` and follows symlinks so that,
+    e.g., ``vim`` (symlinked to ``nvim``) yields ``["vim", "nvim"]``, and
     ``sh`` (symlinked to ``bash``) yields ``["sh", "bash"]``.
 
     The basename of *cmd_arg* is always included first.
     """
-    called = os.path.basename(cmd_arg)
-    names = [called]
+    called: str = os.path.basename(cmd_arg)
+    names: list[str] = [called]
 
-    # Locate the real binary: if the argument contains a slash treat it
-    # as a path directly; otherwise look it up in $PATH.
+    # If the argument contains a slash treat it as a path directly;
+    # otherwise look it up in $PATH.
     if "/" in cmd_arg:
-        resolved = os.path.realpath(cmd_arg)
+        resolved: str = os.path.realpath(cmd_arg)
     else:
-        found = shutil.which(called)
+        found: str | None = shutil.which(called)
         resolved = os.path.realpath(found) if found else ""
 
     if resolved and os.path.isfile(resolved):
-        real_name = os.path.basename(resolved)
+        real_name: str = os.path.basename(resolved)
         if real_name != called:
             names.append(real_name)
 
@@ -58,21 +152,26 @@ def _resolve_app_names(cmd_arg: str) -> list[str]:
 def _config_candidates(home: Path, app: str) -> list[Path]:
     """Return every well-known config path that could belong to *app*."""
     return [
-        home / ".config" / app,          # XDG_CONFIG_HOME default
-        home / ".cache" / app,           # XDG_CACHE_HOME default
-        home / ".local" / "share" / app, # XDG_DATA_HOME default
-        home / ".local" / "state" / app, # XDG_STATE_HOME default
-        home / f".{app}",                # traditional dotdir  (~/.vim/)
-        home / f".{app}rc",              # traditional rc file (~/.vimrc)
+        home / ".config" / app,           # XDG_CONFIG_HOME default
+        home / ".cache" / app,            # XDG_CACHE_HOME default
+        home / ".local" / "share" / app,  # XDG_DATA_HOME default
+        home / ".local" / "state" / app,  # XDG_STATE_HOME default
+        home / f".{app}",                 # traditional dotdir  (~/.vim/)
+        home / f".{app}rc",               # traditional rc file (~/.vimrc)
     ]
 
 
-def _writable_and_readonly(
-    home: Path, names: list[str],
+def _classify_dotfiles(
+    home: Path,
+    names: list[str],
 ) -> tuple[list[Path], list[Path]]:
     """
-    Classify every dotfile/dotdir in *home* as either writable
-    (belongs to one of *names*) or read-only (everything else).
+    Classify every dotfile / dotdir in *home* as either **writable**
+    (belongs to one of *names*) or **read-only** (everything else).
+
+    Sensitive paths listed in ``_SENSITIVE_DOTFILES`` are silently
+    dropped — they are neither mounted read-only nor writable, and are
+    effectively invisible inside the sandbox.
     """
     writable_set: set[Path] = set()
     for name in names:
@@ -80,112 +179,142 @@ def _writable_and_readonly(
             if cand.exists():
                 writable_set.add(cand)
 
-    # Paths that must never be exposed, even read-only.
-    _blacklist = {".ssh"}
-
     readonly: list[Path] = []
     for item in home.glob(".*"):
         if item.name in (".", ".."):
             continue
-        if item.name in _blacklist:
+        if item.name in _SENSITIVE_DOTFILES:
             continue
         if item not in writable_set:
             readonly.append(item)
 
-    # Also strip blacklisted paths from writable (belt and suspenders).
-    writable_set = {p for p in writable_set if p.name not in _blacklist}
-
+    # Note: we do NOT strip sensitive paths from the writable set.
+    # If an app's own config happens to live in a sensitive directory
+    # (e.g. ``codex`` → ~/.codex/), it needs write access regardless.
+    # The blocklist only gates what *other* apps can see (the readonly
+    # side).
     return list(writable_set), readonly
 
 
-def main() -> None:
-    # --- flags and command ---------------------------------------------------
-    args = sys.argv[1:]
-    allow_net = bool(os.environ.get("SANDBOX_NET"))  # env-var fallback
+def _build_etc_hosts_fd() -> int:
+    """
+    Create a pipe containing the minimal hosts file and return the
+    read-end file descriptor.
 
-    # Consume our own flags before the command.
+    The caller is responsible for passing this fd to ``--ro-bind-data``
+    and then closing it after ``os.execvp`` (the kernel will close it
+    on exec anyway, but explicit is better).
+    """
+    r: int
+    w: int
+    r, w = os.pipe()
+    os.write(w, _MINIMAL_HOSTS)
+    os.close(w)
+    return r
+
+
+def _collect_safe_env() -> list[str]:
+    """
+    Build the ``--setenv`` arguments for bubblewrap.
+
+    Returns a flat list of ``["--setenv", "K", "V", ...]`` entries for
+    every environment variable that appears in ``_SAFE_ENV_VARS`` *and*
+    is currently set.  Variables prefixed with ``SANDBOX_`` are
+    forwarded unconditionally.
+    """
+    args: list[str] = []
+    for var, val in sorted(os.environ.items()):
+        if var in _SAFE_ENV_VARS or var.startswith("SANDBOX_"):
+            args += ["--setenv", var, val]
+    return args
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main() -> Never:
+    # ── parse flags & command ──────────────────────────────────────────
+    args: list[str] = sys.argv[1:]
+    allow_net: bool = bool(os.environ.get("SANDBOX_NET"))
+
     while args and args[0] == "--net":
         allow_net = True
         args.pop(0)
 
     if not args:
-        shell = os.environ.get("SHELL", "/bin/sh")
-        cmd = [shell]
-        cmd_arg = shell
+        shell: str = os.environ.get("SHELL", "/bin/sh")
+        cmd: list[str] = [shell]
+        cmd_arg: str = shell
     else:
         cmd = args
         cmd_arg = cmd[0]
 
-    # Resolve the real binary through PATH and symlinks so that, e.g.,
-    # ``vim`` → ``["vim", "nvim"]`` when vim is a symlink to nvim.
-    names = _resolve_app_names(cmd_arg)
+    # ── resolve app identity ───────────────────────────────────────────
+    names: list[str] = _resolve_app_names(cmd_arg)
 
-    home = Path.home()
-    pwd  = Path.cwd()
+    home: Path = Path.home()
+    pwd: Path  = Path.cwd()
 
-    # --- classify home-dir entries -------------------------------------------
-    writable, readonly = _writable_and_readonly(home, names)
+    writable: list[Path]
+    readonly: list[Path]
+    writable, readonly = _classify_dotfiles(home, names)
 
-    # --- build bwrap argument list -------------------------------------------
+    # ── build bwrap arguments ──────────────────────────────────────────
     bwrap: list[str] = []
 
-    # system directories — read-only, needed to run binaries
+    # --- system directories — read-only, needed to run binaries --------
     for d in ("/usr", "/bin", "/sbin", "/etc"):
         if os.path.isdir(d):
             bwrap += ["--ro-bind", d, d]
     for d in ("/lib", "/lib64"):
         bwrap += ["--ro-bind-try", d, d]
 
-    # Overlay a minimal /etc/hosts so the real one (with internal
-    # hostnames, etc.) is not leaked into the sandbox.
-    _fake_hosts = tempfile.NamedTemporaryFile(
-        mode="w", prefix="sb-hosts-", delete=False
-    )
-    _fake_hosts.write(
-        "127.0.0.1   localhost\n"
-        "::1         localhost ip6-localhost ip6-loopback\n"
-    )
-    _fake_hosts.close()
-    bwrap += ["--ro-bind", _fake_hosts.name, "/etc/hosts"]
+    # --- minimal /etc/hosts — overlay so real hostnames don't leak -----
+    hosts_fd: int = _build_etc_hosts_fd()
+    bwrap += ["--ro-bind-data", str(hosts_fd), "/etc/hosts"]
 
-    # home: start with an empty tmpfs so only what we explicitly mount exists
+    # --- home: start with an empty tmpfs --------------------------------
     bwrap += ["--tmpfs", str(home)]
 
-    # everything else in home — read-only (other apps' configs)
-    # Mounted *before* writable paths so that the later writable binds
-    # can punch through read-only parent directories (e.g. ~/.config
-    # is mounted ro here, then ~/.config/nvim/ is mounted rw on top).
+    # --- other apps' configs — read-only --------------------------------
+    # Mounted *before* writable paths so that later writable binds can
+    # punch through read-only parent directories (e.g. ~/.config is
+    # mounted ro here, then ~/.config/nvim/ is mounted rw on top).
     for p in readonly:
         bwrap += ["--ro-bind-try", str(p), str(p)]
 
-    # app-owned configs — read-write (overrides readonly parents above)
+    # --- app-owned configs — read-write (overrides readonly parents) ---
     for p in writable:
         bwrap += ["--bind-try", str(p), str(p)]
 
-    # workspace — the current directory, the only other writable path
-    # Mounted at /work so it doesn't clash with the read-only $HOME.
+    # --- workspace — current directory, the only other writable path ---
+    # Mounted at /work so it doesn't clash with the read-only home.
     bwrap += ["--bind", str(pwd), "/work"]
 
-    # kernel pseudo-filesystems — fresh private instances
+    # --- kernel pseudo-filesystems — fresh private instances ------------
     bwrap += ["--dev", "/dev", "--proc", "/proc"]
 
-    # runtime temps — private & volatile, scrubbed on exit
+    # --- runtime temps — private & volatile, scrubbed on exit -----------
     bwrap += ["--tmpfs", "/tmp", "--tmpfs", "/run"]
 
-    # DNS: if /etc/resolv.conf is a symlink (systemd-resolved, etc.),
-    # follow it and bind-mount the real file so name resolution works.
-    resolv_conf = Path("/etc/resolv.conf")
+    # --- DNS: follow symlink so systemd-resolved works ------------------
+    resolv_conf: Path = Path("/etc/resolv.conf")
     if resolv_conf.is_symlink():
-        target = resolv_conf.resolve()
+        target: Path = resolv_conf.resolve()
         bwrap += ["--ro-bind-try", str(target), str(target)]
 
-    # environment — point HOME to the real path so apps find configs
-    bwrap += ["--setenv", "HOME", str(home)]
+    # --- seccomp — optional BPF policy ---------------------------------
+    if _SECCOMP_PROFILE.is_file():
+        bwrap += ["--seccomp", str(_SECCOMP_PROFILE)]
 
-    # namespaces — isolate pid, ipc, uts, user, cgroup by default.
-    # Network is isolated unless SANDBOX_NET=1 is set in the environment.
-    # --die-with-parent ensures the sandbox is torn down if the outer
-    # shell dies, preventing orphaned namespaces.
+    # --- environment — strip everything, then reinject safe vars --------
+    bwrap += ["--clearenv"]
+    bwrap += _collect_safe_env()
+
+    # --- namespaces — isolate pid, ipc, uts, user, cgroup --------------.
+    # Network is isolated unless --net / SANDBOX_NET is set.
+    # --die-with-parent ensures teardown if the outer shell dies.
     bwrap += [
         "--unshare-user",
         "--unshare-ipc",
@@ -200,11 +329,13 @@ def main() -> None:
         "--die-with-parent",
     ]
 
-    # Separate bwrap flags from the command to run.
+    # --- command separator ----------------------------------------------
     bwrap += ["--"]
 
-    # Replace this process with bwrap so there's no lingering Python process.
+    # Replace this process with bwrap — no lingering Python process.
     os.execvp("bwrap", ["bwrap"] + bwrap + cmd)
+    # os.execvp never returns on success, but keep mypy happy:
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

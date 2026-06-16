@@ -23,7 +23,7 @@ locked down.
 │   ├── .$APPrc           (rw)
 │   ├── everything else   (ro-bind-try — unless blocked)
 │   └── sensitive paths   (not mounted — see blocklist below)
-└── work/                 (rw-bind from $PWD)
+└── w/<full-path-to-$PWD>/  (rw-bind from $PWD)
 ```
 
 ## App config discovery
@@ -66,7 +66,7 @@ Defined as `_SENSITIVE_DOTFILES` in the script.
 1. --tmpfs $HOME                (empty home)
 2. --ro-bind-try <safe dotfiles>  (skip blocked paths)
 3. --bind-try <app configs>       (writable, overrides step 2)
-4. --bind $PWD /work              (workspace)
+4. --bind $PWD /w/<full-path>       (workspace)
 ```
 
 Later mounts override earlier ones at the same path, so step 3 punches

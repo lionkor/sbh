@@ -284,9 +284,9 @@ def main() -> Never:
     for p in writable:
         bwrap += ["--bind-try", str(p), str(p)]
 
-    # --- workspace — current directory, the only other writable path ---
-    # Mounted at /work so it doesn't clash with the read-only home.
-    bwrap += ["--bind", str(pwd), "/work"]
+    # --- workspace — current directory at /w/<full-path> ------------
+    wdir: str = "/w" + str(pwd)
+    bwrap += ["--bind", str(pwd), wdir]
 
     # --- kernel pseudo-filesystems — fresh private instances ------------
     bwrap += ["--dev", "/dev", "--proc", "/proc"]
@@ -321,7 +321,7 @@ def main() -> Never:
     if not allow_net:
         bwrap += ["--unshare-net"]
     bwrap += [
-        "--chdir", "/work",
+        "--chdir", wdir,
         "--die-with-parent",
     ]
 

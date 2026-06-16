@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+sandbox-here — run a command isolated to the current directory.
+
+Uses bubblewrap to create a container where only $PWD is writable.
+The command's own config files (~/.config/<app>, ~/.cache/<app>,
+~/.<app>/, ~/.<app>rc, etc.) are auto-discovered and mounted
+read-write so the app can read and update its settings.  All other
+dotfiles in $HOME are mounted read-only; non-dot directories
+(Downloads, Documents, src, …) don't exist in the sandbox.
+
+No access to /root, /mnt, /media, /var, /opt.
+Network is isolated by default.  Set SANDBOX_NET=1 to allow it
+(e.g. for API calls, package managers, etc.).
+
+Dependencies: bubblewrap (bwrap)
+
+Usage: sandbox-here [--net] [command...]
+       sandbox-here              (opens $SHELL in the sandbox)
+"""
+
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _resolve_app_names(cmd_arg: str) -> list[str]:
+    """
+    Return every name the app could be known as.
+
+    Resolves the command through PATH and follows symlinks so that, e.g.,
+    ``vim`` (symlinked to ``nvim``) yields ``["vim", "nvim"]``, and
+    ``sh`` (symlinked to ``bash``) yields ``["sh", "bash"]``.
+
+    The basename of *cmd_arg* is always included first.
+    """
+    called = os.path.basename(cmd_arg)
+    names = [called]
+
+    # Locate the real binary: if the argument contains a slash treat it
+    # as a path directly; otherwise look it up in $PATH.
+    if "/" in cmd_arg:
+        resolved = os.path.realpath(cmd_arg)
+    else:
+        found = shutil.which(called)
+        resolved = os.path.realpath(found) if found else ""
+
+    if resolved and os.path.isfile(resolved):
+        real_name = os.path.basename(resolved)
+        if real_name != called:
+            names.append(real_name)
+
+    return names
+
+
+def _config_candidates(home: Path, app: str) -> list[Path]:
+    """Return every well-known config path that could belong to *app*."""
+    return [
+        home / ".config" / app,          # XDG_CONFIG_HOME default
+        home / ".cache" / app,           # XDG_CACHE_HOME default
+        home / ".local" / "share" / app, # XDG_DATA_HOME default
+        home / ".local" / "state" / app, # XDG_STATE_HOME default
+        home / f".{app}",                # traditional dotdir  (~/.vim/)
+        home / f".{app}rc",              # traditional rc file (~/.vimrc)
+    ]
+
+
+def _writable_and_readonly(
+    home: Path, names: list[str],
+) -> tuple[list[Path], list[Path]]:
+    """
+    Classify every dotfile/dotdir in *home* as either writable
+    (belongs to one of *names*) or read-only (everything else).
+    """
+    writable_set: set[Path] = set()
+    for name in names:
+        for cand in _config_candidates(home, name):
+            if cand.exists():
+                writable_set.add(cand)
+
+    # Paths that must never be exposed, even read-only.
+    _blacklist = {".ssh"}
+
+    readonly: list[Path] = []
+    for item in home.glob(".*"):
+        if item.name in (".", ".."):
+            continue
+        if item.name in _blacklist:
+            continue
+        if item not in writable_set:
+            readonly.append(item)
+
+    # Also strip blacklisted paths from writable (belt and suspenders).
+    writable_set = {p for p in writable_set if p.name not in _blacklist}
+
+    return list(writable_set), readonly
+
+
+def main() -> None:
+    # --- flags and command ---------------------------------------------------
+    args = sys.argv[1:]
+    allow_net = bool(os.environ.get("SANDBOX_NET"))  # env-var fallback
+
+    # Consume our own flags before the command.
+    while args and args[0] == "--net":
+        allow_net = True
+        args.pop(0)
+
+    if not args:
+        shell = os.environ.get("SHELL", "/bin/sh")
+        cmd = [shell]
+        cmd_arg = shell
+    else:
+        cmd = args
+        cmd_arg = cmd[0]
+
+    # Resolve the real binary through PATH and symlinks so that, e.g.,
+    # ``vim`` → ``["vim", "nvim"]`` when vim is a symlink to nvim.
+    names = _resolve_app_names(cmd_arg)
+
+    home = Path.home()
+    pwd  = Path.cwd()
+
+    # --- classify home-dir entries -------------------------------------------
+    writable, readonly = _writable_and_readonly(home, names)
+
+    # --- build bwrap argument list -------------------------------------------
+    bwrap: list[str] = []
+
+    # system directories — read-only, needed to run binaries
+    for d in ("/usr", "/bin", "/sbin", "/etc"):
+        if os.path.isdir(d):
+            bwrap += ["--ro-bind", d, d]
+    for d in ("/lib", "/lib64"):
+        bwrap += ["--ro-bind-try", d, d]
+
+    # Overlay a minimal /etc/hosts so the real one (with internal
+    # hostnames, etc.) is not leaked into the sandbox.
+    _fake_hosts = tempfile.NamedTemporaryFile(
+        mode="w", prefix="sb-hosts-", delete=False
+    )
+    _fake_hosts.write(
+        "127.0.0.1   localhost\n"
+        "::1         localhost ip6-localhost ip6-loopback\n"
+    )
+    _fake_hosts.close()
+    bwrap += ["--ro-bind", _fake_hosts.name, "/etc/hosts"]
+
+    # home: start with an empty tmpfs so only what we explicitly mount exists
+    bwrap += ["--tmpfs", str(home)]
+
+    # everything else in home — read-only (other apps' configs)
+    # Mounted *before* writable paths so that the later writable binds
+    # can punch through read-only parent directories (e.g. ~/.config
+    # is mounted ro here, then ~/.config/nvim/ is mounted rw on top).
+    for p in readonly:
+        bwrap += ["--ro-bind-try", str(p), str(p)]
+
+    # app-owned configs — read-write (overrides readonly parents above)
+    for p in writable:
+        bwrap += ["--bind-try", str(p), str(p)]
+
+    # workspace — the current directory, the only other writable path
+    # Mounted at /work so it doesn't clash with the read-only $HOME.
+    bwrap += ["--bind", str(pwd), "/work"]
+
+    # kernel pseudo-filesystems — fresh private instances
+    bwrap += ["--dev", "/dev", "--proc", "/proc"]
+
+    # runtime temps — private & volatile, scrubbed on exit
+    bwrap += ["--tmpfs", "/tmp", "--tmpfs", "/run"]
+
+    # DNS: if /etc/resolv.conf is a symlink (systemd-resolved, etc.),
+    # follow it and bind-mount the real file so name resolution works.
+    resolv_conf = Path("/etc/resolv.conf")
+    if resolv_conf.is_symlink():
+        target = resolv_conf.resolve()
+        bwrap += ["--ro-bind-try", str(target), str(target)]
+
+    # environment — point HOME to the real path so apps find configs
+    bwrap += ["--setenv", "HOME", str(home)]
+
+    # namespaces — isolate pid, ipc, uts, user, cgroup by default.
+    # Network is isolated unless SANDBOX_NET=1 is set in the environment.
+    # --die-with-parent ensures the sandbox is torn down if the outer
+    # shell dies, preventing orphaned namespaces.
+    bwrap += [
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+    ]
+    if not allow_net:
+        bwrap += ["--unshare-net"]
+    bwrap += [
+        "--chdir", "/work",
+        "--die-with-parent",
+    ]
+
+    # Separate bwrap flags from the command to run.
+    bwrap += ["--"]
+
+    # Replace this process with bwrap so there's no lingering Python process.
+    os.execvp("bwrap", ["bwrap"] + bwrap + cmd)
+
+
+if __name__ == "__main__":
+    main()

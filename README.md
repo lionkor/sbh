@@ -5,8 +5,7 @@ files.  Everything else in your home directory is either read-only or
 hidden completely.
 
 It's a Python script that builds a bubblewrap container and drops your
-command inside.  No SUID binaries, no daemon, no root.  Just Linux
-namespaces.
+command inside.
 
 ## Why?
 

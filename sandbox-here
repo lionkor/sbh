@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Never
 
@@ -101,13 +102,6 @@ _SAFE_ENV_VARS: set[str] = {
     "VCPKG_ROOT",
     "MAKEFLAGS",
 }
-
-# Minimal /etc/hosts — prevents leaking internal hostnames (raptor,
-# dragon, etc.) from the host's real file.
-_MINIMAL_HOSTS: bytes = (
-    b"127.0.0.1   localhost\n"
-    b"::1         localhost ip6-localhost ip6-loopback\n"
-)
 
 # Path to an optional seccomp BPF policy file (lives next to this script).
 # If present, loaded with ``--seccomp`` to restrict available syscalls.
@@ -196,21 +190,23 @@ def _classify_dotfiles(
     return list(writable_set), readonly
 
 
-def _build_etc_hosts_fd() -> int:
+def _build_etc_hosts_file() -> str:
     """
-    Create a pipe containing the minimal hosts file and return the
-    read-end file descriptor.
+    Write the minimal hosts file to a real tempfile and return its path.
 
-    The caller is responsible for passing this fd to ``--ro-bind-data``
-    and then closing it after ``os.execvp`` (the kernel will close it
-    on exec anyway, but explicit is better).
+    Uses a tempfile instead of ``--ro-bind-data`` with a pipe because
+    bwrap writes the data to a file *inside* the destination directory,
+    and ``/etc`` is already a read-only bind mount at that point.
+
+    The tempfile is tiny and lives in ``/tmp`` — it's cleaned on reboot.
     """
-    r: int
-    w: int
-    r, w = os.pipe()
-    os.write(w, _MINIMAL_HOSTS)
-    os.close(w)
-    return r
+    fd: int
+    path: str
+    fd, path = tempfile.mkstemp(prefix="sb-hosts-", text=True)
+    with os.fdopen(fd, "w") as f:
+        f.write("127.0.0.1   localhost\n")
+        f.write("::1         localhost ip6-localhost ip6-loopback\n")
+    return path
 
 
 def _collect_safe_env() -> list[str]:
@@ -271,8 +267,8 @@ def main() -> Never:
         bwrap += ["--ro-bind-try", d, d]
 
     # --- minimal /etc/hosts — overlay so real hostnames don't leak -----
-    hosts_fd: int = _build_etc_hosts_fd()
-    bwrap += ["--ro-bind-data", str(hosts_fd), "/etc/hosts"]
+    hosts_path: str = _build_etc_hosts_file()
+    bwrap += ["--ro-bind", hosts_path, "/etc/hosts"]
 
     # --- home: start with an empty tmpfs --------------------------------
     bwrap += ["--tmpfs", str(home)]

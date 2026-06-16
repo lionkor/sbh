@@ -113,7 +113,7 @@ with the host — no firewall rules or further restrictions apply.
 
 ## /etc/hosts
 
-Overlaid with `--ro-bind-data` from a pipe:
+Overlaid with `--ro-bind` from a tempfile:
 
 ```
 127.0.0.1   localhost
@@ -121,6 +121,9 @@ Overlaid with `--ro-bind-data` from a pipe:
 ```
 
 Prevents leaking internal hostnames from the real `/etc/hosts`.
+Uses a tempfile rather than `--ro-bind-data` because bwrap writes
+the data inside the destination directory, which is already a
+read-only mount.
 
 ## Seccomp
 

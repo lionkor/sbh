@@ -9,13 +9,12 @@ command inside.
 
 ## Why?
 
-AI coding agents run LLM-generated shell commands on your machine.  Even
-with human approval on each one, there's a lot that can go wrong — reading
-SSH keys, scraping shell history, exfiltrating `~/Documents`, modifying
-git config, leaking internal hostnames.
+AI coding agents run LLM-generated shell commands on your machine.  A
+command can read SSH keys, scrape shell history, exfiltrate `~/Documents`,
+modify git config, or leak internal hostnames — even after you approved it.
 
-`sandbox-here` closes that gap.  The command sees the project directory
-and its own config.  That's it.
+`sandbox-here` blocks all of that.  The command sees the project directory
+and its own config.  Nothing else.
 
 ## What it's not
 
@@ -26,8 +25,8 @@ seccomp filter unless you add one, no resource limits, and writes to the
 app's own config directory persist on disk.
 
 Think of it like locking your car.  Stops casual snooping and mistakes.
-Won't stop someone with a brick.  For running code you genuinely don't
-trust, use a VM or a separate machine.
+Won't stop someone with a brick.  For running code you don't trust, use
+a VM or a separate machine.
 
 ## Installation
 
@@ -58,14 +57,14 @@ sbh npm install
 sbh make
 sbh cargo build
 
-# Allow network — for package managers, curl, etc.
+# Allow network — for package managers or curl
 sbh --net pip install requests
 ```
 
-When you run `sbh npm`, the script figures out the app is `npm` and mounts
-`~/.npm/` read-write so it can use the cache.  `sbh cargo` gets `~/.cargo/`,
-`sbh git` gets `~/.gitconfig`, and so on.  If you run `sbh` with no command
-it opens your shell and makes the shell's own configs writable.
+When you run `sbh npm`, the script detects `npm` and mounts `~/.npm/`
+read-write.  `sbh cargo` gets `~/.cargo/`, `sbh git` gets `~/.gitconfig`.
+`sbh` with no command opens your shell and makes the shell's own configs
+writable.
 
 Symlinks are followed.  If `/usr/bin/sh` points to `bash`, running `sbh sh`
 grants write access to `~/.bashrc` and `~/.config/bash/`.
@@ -85,24 +84,23 @@ re-injected (`PATH`, `HOME`, `TERM`, `LANG`, a few toolchain vars).
 `DBUS_SESSION_BUS_ADDRESS` — all stripped.  If you need to pass something
 through, prefix it with `SANDBOX_`.
 
-`/etc/hosts` is overlaid with a minimal file so your internal hostnames
-(LAN machines, Tailnet nodes, etc.) don't leak.
+`/etc/hosts` is overlaid with a minimal file so your LAN machines,
+Tailnet nodes, and other internal hostnames don't leak.
 
 Network is off by default.  `--net` turns it on.
 
 ## What doesn't get blocked
 
 Any dotfile not on the blocklist is visible read-only — `.bashrc`,
-`.gitconfig`, `.vimrc`, and so on.  If you stash secrets in those,
-they're visible.
+`.gitconfig`, `.vimrc`.  If you stash secrets in those, they're visible.
 
 With `--net`, the command has the same network access you do.  It can hit
 localhost services, scan your LAN, make outbound connections.
 
 The app's own config directory is writable and persists to disk.  If you
 run `sbh pi`, the agent's config at `~/.pi/` survives sandbox teardown.
-That's by design (the agent needs it), but it means a compromised agent
-can modify its own settings to persist across restarts.
+A compromised agent can modify its own settings to persist across
+restarts.
 
 `/etc/passwd`, `/proc/cpuinfo`, and other world-readable system files are
 visible.  No attempt is made to hide them.

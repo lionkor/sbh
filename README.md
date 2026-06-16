@@ -59,6 +59,16 @@ sbh cargo build
 
 # Allow network — for package managers or curl
 sbh --net pip install requests
+
+# Mount container runtime sockets
+sbh --docker docker build .
+sbh --podman podman run ...
+sbh --docker --net docker pull alpine
+
+# Mount extra files/dirs (ro = read-only, rw = read-write)
+sbh --add ro /usr/share/dict/words /usr/share/dict/words
+sbh --add rw /tmp/scratch /tmp/scratch
+sbh --add ro /some/config.json /etc/myapp/config.json
 ```
 
 When you run `sbh npm`, the script detects `npm` and mounts `~/.npm/`
@@ -88,6 +98,17 @@ through, prefix it with `SANDBOX_`.
 Tailnet nodes, and other internal hostnames don't leak.
 
 Network is off by default.  `--net` turns it on.
+
+Container sockets (`--docker`, `--podman`, `--containerd`) are not
+mounted by default.  Pass the flag to bind-mount the socket into the
+sandbox so `docker`, `podman`, or `ctr` work inside.  `--docker`
+respects `DOCKER_HOST` when set to a `unix://` path; TCP daemons need
+`--net` instead (no local socket to mount).
+
+Use `--add ro|rw SRC DST` to mount arbitrary paths.  `ro` gives
+read-only access, `rw` gives read-write.  Repeat `--add` for multiple
+paths.  Both SRC and DST are required — if you want the same path at
+the same mount point, specify it twice.
 
 ## What doesn't get blocked
 

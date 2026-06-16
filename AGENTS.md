@@ -66,7 +66,9 @@ Defined as `_SENSITIVE_DOTFILES` in the script.
 1. --tmpfs $HOME                (empty home)
 2. --ro-bind-try <safe dotfiles>  (skip blocked paths)
 3. --bind-try <app configs>       (writable, overrides step 2)
-4. --bind $PWD /w/<full-path>       (workspace)
+4. --bind-try <container sockets> (--docker / --podman / --containerd)
+5. --ro-bind or --bind <extra>    (--add ro|rw SRC DST)
+6. --bind $PWD /w/<full-path>       (workspace)
 ```
 
 Later mounts override earlier ones at the same path, so step 3 punches
@@ -97,6 +99,31 @@ Defined as `_SAFE_ENV_VARS` in the script.  Secrets like
 Isolated by default (`--unshare-net`).  Opt-in with `--net` flag or
 `SANDBOX_NET=1`.  When network is enabled, the namespace is shared
 with the host — no firewall rules or further restrictions apply.
+
+## Container sockets
+
+Not mounted by default.  Opt-in with flags:
+
+| Flag | Default socket | Notes |
+|------|---------------|-------|
+| `--docker` | `/var/run/docker.sock` | Respects `DOCKER_HOST=unix://...`; TCP daemons need `--net` |
+| `--podman` | `/run/user/$UID/podman/podman.sock` | |
+| `--containerd` | `/run/containerd/containerd.sock` | |
+
+Sockets are bind-mounted read-write (`--bind-try`).  Missing sockets are
+a silent no-op.
+
+## Extra mounts (`--add`)
+
+`--add ro|rw SRC DST` mounts arbitrary paths into the sandbox.
+
+- `ro` — read-only bind mount (`--ro-bind`)
+- `rw` — read-write bind mount (`--bind`)
+- Both SRC and DST are required.  To mount at the same path, repeat it:
+  `--add rw /tmp/scratch /tmp/scratch`.
+- Fails immediately if SRC doesn't exist (unlike socket flags which
+  use `--bind-try`).
+- Repeatable for multiple paths.
 
 ## Namespaces
 

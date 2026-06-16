@@ -20,7 +20,9 @@ and display cookies are never leaked into the sandbox.
 
 Dependencies: bubblewrap ≥ 0.11 (for --bind-data, --clearenv)
 
-Usage: sandbox-here [--net] [command...]
+Usage: sandbox-here [--net] [--docker] [--podman] [--containerd]
+                     [--add ro|rw SRC DST] ...
+                     [command...]
        sandbox-here              (opens $SHELL in the sandbox)
 """
 
@@ -45,7 +47,7 @@ _SENSITIVE_DOTFILES: set[str] = {
     ".gnupg",        # GPG keyring
     ".codex",        # OpenAI JWT access / refresh tokens
     ".pki",          # NSS certificate database
-    ".docker",       # Docker registry credentials
+    ".docker",       # Docker registry credentials (not the socket)
     ".mozilla",      # Firefox profiles (cookies, saved logins)
     ".thunderbird",  # Thunderbird profiles
     ".librewolf",    # LibreWolf profiles
@@ -108,6 +110,14 @@ _SAFE_ENV_VARS: set[str] = {
 # An example policy can be found in the bubblewrap repository:
 # https://github.com/containers/bubblewrap/tree/main/demos
 _SECCOMP_PROFILE: Path = Path(__file__).resolve().parent / "seccomp.bpf"
+
+# Well-known container runtime sockets.  Mounted with --bind-try so a
+# missing socket is a silent no-op rather than a fatal error.
+_CONTAINER_SOCKET_SPECS: dict[str, str] = {
+    "--docker":      "/var/run/docker.sock",
+    "--podman":      f"/run/user/{os.getuid()}/podman/podman.sock",
+    "--containerd":  "/run/containerd/containerd.sock",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -225,6 +235,44 @@ def _collect_safe_env() -> list[str]:
     return args
 
 
+def _resolve_docker_socket() -> str | None:
+    """
+    Return the host Docker socket path, or ``None`` if the daemon is
+    reachable over TCP (no local socket to mount).
+
+    Respects ``DOCKER_HOST`` when set to a ``unix://`` path.
+    """
+    docker_host: str = os.environ.get("DOCKER_HOST", "")
+    if docker_host.startswith("unix://"):
+        return docker_host[7:]
+    if docker_host.startswith(("tcp://", "http://", "https://")):
+        return None  # remote daemon — needs network, no socket
+    return "/var/run/docker.sock"
+
+
+def _parse_add_flag(arg: str, args: list[str], idx: int) -> tuple[str, str, str] | None:
+    """
+    Parse ``--add ro|rw SRC DST`` at position *idx* in *args*.
+
+    Returns ``(mode, src, dst)`` on success, ``None`` if the syntax is
+    wrong.  *mode* is ``"ro"`` or ``"rw"``.
+
+    *args* is advanced past 3 tokens (the flag + mode + src + dst) on
+    success.
+    """
+    if idx + 3 >= len(args):
+        return None
+    mode: str = args[idx + 1]
+    if mode not in ("ro", "rw"):
+        return None
+    src: str = args[idx + 2]
+    dst: str = args[idx + 3]
+
+    for _ in range(4):
+        args.pop(idx)
+    return (mode, src, dst)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════
@@ -233,10 +281,43 @@ def main() -> Never:
     # ── parse flags & command ──────────────────────────────────────────
     args: list[str] = sys.argv[1:]
     allow_net: bool = bool(os.environ.get("SANDBOX_NET"))
+    container_sockets: list[str] = []   # paths to bind-try (rw)
+    extra_mounts: list[tuple[str, str, str]] = []  # (mode, src, dst)
 
-    while args and args[0] == "--net":
-        allow_net = True
-        args.pop(0)
+    while args and args[0].startswith("-"):
+        flag: str = args[0]
+
+        if flag == "--":
+            args.pop(0)
+            break  # end of flags, rest is command
+
+        elif flag == "--net":
+            allow_net = True
+            args.pop(0)
+
+        elif flag in _CONTAINER_SOCKET_SPECS:
+            sock: str = _CONTAINER_SOCKET_SPECS[flag]
+            # --docker overrides the default with DOCKER_HOST (unix://).
+            if flag == "--docker":
+                resolved: str | None = _resolve_docker_socket()
+                if resolved is not None:
+                    sock = resolved
+                else:
+                    args.pop(0)
+                    continue  # TCP daemon — nothing to mount
+            container_sockets.append(sock)
+            args.pop(0)
+
+        elif flag == "--add":
+            parsed: tuple[str, str, str] | None = _parse_add_flag(flag, args, 0)
+            if parsed is None:
+                print("usage: --add ro|rw SRC DST", file=sys.stderr)
+                sys.exit(2)
+            extra_mounts.append(parsed)
+            # args already advanced by _parse_add_flag
+
+        else:
+            break  # unknown flag → treat as command
 
     if not args:
         shell: str = os.environ.get("SHELL", "/bin/sh")
@@ -283,6 +364,15 @@ def main() -> Never:
     # --- app-owned configs — read-write (overrides readonly parents) ---
     for p in writable:
         bwrap += ["--bind-try", str(p), str(p)]
+
+    # --- container runtime sockets — read-write (opt-in via flags) ------
+    for sock in container_sockets:
+        bwrap += ["--bind-try", sock, sock]
+
+    # --- user-requested extra mounts (--add) ---------------------------
+    for mode, src, dst in extra_mounts:
+        flag: str = "--ro-bind" if mode == "ro" else "--bind"
+        bwrap += [flag, src, dst]
 
     # --- workspace — current directory at /w/<full-path> ------------
     wdir: str = "/w" + str(pwd)
